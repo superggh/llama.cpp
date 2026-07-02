@@ -1,22 +1,35 @@
 package com.example.llama
 
+import android.Manifest
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.widget.EditText
 import android.widget.TextView
+import android.widget.ArrayAdapter
+import android.widget.AutoCompleteTextView
+import com.google.android.material.textfield.TextInputLayout
 import android.widget.Toast
 import androidx.activity.addCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.arm.aichat.AiChat
 import com.arm.aichat.InferenceEngine
+import com.arm.aichat.ble.BleTranslatorService
 import com.arm.aichat.gguf.GgufMetadata
 import com.arm.aichat.gguf.GgufMetadataReader
+import com.arm.aichat.translator.TranslatorOrchestrator
+import com.google.android.material.button.MaterialButton
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,24 +37,38 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
 
-    // Android views
     private lateinit var ggufTv: TextView
     private lateinit var messagesRv: RecyclerView
     private lateinit var userInputEt: EditText
     private lateinit var userActionFab: FloatingActionButton
+    private lateinit var btnLoadWhisper: MaterialButton
+    private lateinit var btnBle: MaterialButton
+    private lateinit var btnVoice: MaterialButton
+    private lateinit var statusTv: TextView
+    private lateinit var sourceLangInput: AutoCompleteTextView
+    private lateinit var targetLangInput: AutoCompleteTextView
+    private lateinit var sourceLangLayout: TextInputLayout
+    private lateinit var targetLangLayout: TextInputLayout
 
-    // Arm AI Chat inference engine
     private lateinit var engine: InferenceEngine
-    private var generationJob: Job? = null
+    private lateinit var translator: TranslatorOrchestrator
 
-    // Conversation states
+    private var generationJob: Job? = null
     private var isModelReady = false
+    private var isVoiceActive = false
+    @Deprecated("whisper replaced by FunASR") private var whisperModelPath: String? = null
+    private var currentModelFile: File? = null
+
+    private val languages = listOf("Auto", "Chinese", "English", "Japanese", "Korean", "Spanish", "French", "German", "Russian", "Arabic")
+    private var sourceLanguage = "Auto"
+    private var targetLanguage = "English"
+
     private val messages = mutableListOf<Message>()
     private val lastAssistantMsg = StringBuilder()
     private val messageAdapter = MessageAdapter(messages)
@@ -50,31 +77,362 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
-        // View model boilerplate and state management is out of this basic sample's scope
         onBackPressedDispatcher.addCallback { Log.w(TAG, "Ignore back press for simplicity") }
 
-        // Find views
         ggufTv = findViewById(R.id.gguf)
         messagesRv = findViewById(R.id.messages)
         messagesRv.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
         messagesRv.adapter = messageAdapter
         userInputEt = findViewById(R.id.user_input)
         userActionFab = findViewById(R.id.fab)
+        btnLoadWhisper = findViewById(R.id.btn_load_whisper)
+        btnBle = findViewById(R.id.btn_ble)
+        btnVoice = findViewById(R.id.btn_voice)
+        statusTv = findViewById(R.id.status)
+        sourceLangInput = findViewById(R.id.source_lang)
+        targetLangInput = findViewById(R.id.target_lang)
+        sourceLangLayout = findViewById(R.id.source_lang_layout)
+        targetLangLayout = findViewById(R.id.target_lang_layout)
 
-        // Arm AI Chat initialization
+        setupLanguagePickers()
+
+        requestPermissionsIfNeeded()
+
         lifecycleScope.launch(Dispatchers.Default) {
             engine = AiChat.getInferenceEngine(applicationContext)
+            translator = TranslatorOrchestrator(applicationContext, engine)
+            observeTranslator()
+            withContext(Dispatchers.Main) {
+                loadModelsOnStartup()
+            }
         }
 
-        // Upon CTA button tapped
         userActionFab.setOnClickListener {
-            if (isModelReady) {
-                // If model is ready, validate input and send to engine
-                handleUserInput()
-            } else {
-                // Otherwise, prompt user to select a GGUF metadata on the device
-                getContent.launch(arrayOf("*/*"))
+            if (isModelReady) handleUserInput() else getContent.launch(arrayOf("*/*"))
+        }
+
+        btnLoadWhisper.setOnClickListener { handleLoadFunasrClick() }
+        btnBle.setOnClickListener { handleBleAction() }
+        btnVoice.setOnClickListener { toggleVoiceChat() }
+        findViewById<com.google.android.material.button.MaterialButton>(R.id.btn_swap_lang).setOnClickListener { swapLanguages() }
+    }
+
+    private fun findFunasrLlmModel(): File? {
+        val funasrDir = File(filesDir, "funasr")
+        val candidates = funasrDir.listFiles { _, name ->
+            name.endsWith(FILE_EXTENSION_GGUF, ignoreCase = true) && name.startsWith("qwen3", ignoreCase = true)
+        }
+        return candidates?.maxByOrNull { it.lastModified() }
+    }
+
+    private fun findTranslationModel(): File? {
+        val modelsDir = ensureModelsDirectory()
+        val candidates = modelsDir.listFiles { _, name ->
+            name.endsWith(FILE_EXTENSION_GGUF, ignoreCase = true)
+        }
+        return candidates?.maxByOrNull { it.lastModified() }
+    }
+
+    private fun findFunasrEncoder(): File? {
+        val enc = File(filesDir, "funasr/funasr-encoder-f16.gguf")
+        return if (enc.exists() && enc.isFile && enc.canRead()) enc else null
+    }
+
+    private fun loadModelsOnStartup() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val encoderFile = findFunasrEncoder()
+                val funasrLlmFile = findFunasrLlmModel()
+                val translationModelFile = findTranslationModel()
+
+                if (encoderFile == null || funasrLlmFile == null) {
+                    withContext(Dispatchers.Main) {
+                        setStatus("FunASR encoder or LLM not found in files/funasr/")
+                    }
+                    return@launch
+                }
+
+                // Load FunASR
+                withContext(Dispatchers.Main) {
+                    setStatus("Loading FunASR LLM: ${funasrLlmFile.name}")
+                    loadFunasrModel(encoderFile.path, funasrLlmFile.path, useSharedModel = false)
+                }
+
+                // Load translation engine
+                if (translationModelFile != null) {
+                    withContext(Dispatchers.Main) {
+                        setStatus("Loading translation engine: ${translationModelFile.name}")
+                        loadLlmModel(translationModelFile)
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        setStatus("Translation model not found in files/models/")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load models", e)
+                withContext(Dispatchers.Main) {
+                    setStatus("Load failed: ${e.message}")
+                    Toast.makeText(this@MainActivity, "Load failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
+        }
+    }
+
+    private fun setupLanguagePickers() {
+        val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, languages)
+        sourceLangInput.setAdapter(adapter)
+        targetLangInput.setAdapter(adapter)
+
+        sourceLangInput.setOnItemClickListener { _, _, position, _ ->
+            sourceLanguage = languages[position]
+            updateLanguageLabels()
+        }
+        targetLangInput.setOnItemClickListener { _, _, position, _ ->
+            targetLanguage = languages[position]
+            updateLanguageLabels()
+        }
+        updateLanguageLabels()
+    }
+
+    private fun updateLanguageLabels() {
+        sourceLangLayout.hint = "Source: $sourceLanguage"
+        targetLangLayout.hint = "Target: $targetLanguage"
+    }
+
+    private fun swapLanguages() {
+        if (sourceLanguage == "Auto") {
+            Toast.makeText(this, "Cannot swap when source is Auto", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val temp = sourceLanguage
+        sourceLanguage = targetLanguage
+        targetLanguage = temp
+        sourceLangInput.setText(sourceLanguage, false)
+        targetLangInput.setText(targetLanguage, false)
+        updateLanguageLabels()
+    }
+
+    private fun loadLlmModel(modelFile: File) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                currentModelFile = modelFile
+                val metadata = contentResolver.openFileDescriptor(Uri.fromFile(modelFile), "r")?.use { fd ->
+                    GgufMetadataReader.create().readStructuredMetadata(FileInputStream(fd.fileDescriptor))
+                }
+                withContext(Dispatchers.Main) {
+                    ggufTv.text = metadata?.toString() ?: modelFile.name
+                    setStatus("Loading LLM model...")
+                }
+                engine.loadModel(modelFile.path)
+                withContext(Dispatchers.Main) {
+                    isModelReady = true
+                    currentModelFile = modelFile
+                    userInputEt.hint = "Type and send a message!"
+                    userInputEt.isEnabled = true
+                    userActionFab.setImageResource(R.drawable.outline_send_24)
+                    userActionFab.isEnabled = true
+                    setStatus("LLM model ready: ${modelFile.name}")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    setStatus("LLM auto-load failed: ${e.message}")
+                    Toast.makeText(this@MainActivity, "LLM load failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun handleLoadFunasrClick() {
+        val encoderFile = findFunasrEncoder()
+        val funasrLlmFile = findFunasrLlmModel()
+        if (encoderFile == null) {
+            Toast.makeText(this, "FunASR encoder not found in files/funasr/", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (funasrLlmFile == null) {
+            Toast.makeText(this, "FunASR LLM not found in files/funasr/", Toast.LENGTH_LONG).show()
+            return
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            withContext(Dispatchers.Main) {
+                setStatus("Loading FunASR models...")
+                loadFunasrModel(encoderFile.path, funasrLlmFile.path, useSharedModel = false)
+            }
+        }
+    }
+
+    private fun loadFunasrModel(encoderPath: String, llmPath: String, useSharedModel: Boolean = false) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                translator.loadFunasrModel(encoderPath, llmPath, useSharedModel)
+                withContext(Dispatchers.Main) {
+                    setStatus("FunASR loaded")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    setStatus("FunASR load failed: ${e.message}")
+                    Toast.makeText(this@MainActivity, "FunASR load failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun setStatus(message: String) {
+        statusTv.text = "Status: $message"
+        Log.i(TAG, "Status: $message")
+    }
+
+    private fun requestPermissionsIfNeeded() {
+        val permissions = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADMIN) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_ADMIN)
+            }
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            permissions.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (permissions.isNotEmpty()) {
+            permissionLauncher.launch(permissions.toTypedArray())
+        }
+    }
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val denied = results.filter { !it.value }.keys
+        if (denied.isNotEmpty()) {
+            Toast.makeText(this, "Permissions required: $denied", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun observeTranslator() {
+        lifecycleScope.launch {
+            translator.state.collect { state ->
+                withContext(Dispatchers.Main) {
+                    updateUiForState(state)
+                    when (state) {
+                        is TranslatorOrchestrator.State.Listening -> setStatus("Listening...")
+                        is TranslatorOrchestrator.State.Transcribing -> setStatus("Transcribing...")
+                        is TranslatorOrchestrator.State.Translating -> setStatus("Translating...")
+                        is TranslatorOrchestrator.State.Error -> setStatus("Error: ${state.message}")
+                        else -> {}
+                    }
+                }
+            }
+        }
+        lifecycleScope.launch {
+            translator.events.collect { event ->
+                withContext(Dispatchers.Main) {
+                    when (event) {
+                        is TranslatorOrchestrator.Event.FunasrLoaded -> {
+                            setStatus("FunASR loaded")
+                            Toast.makeText(this@MainActivity, "FunASR loaded", Toast.LENGTH_SHORT).show()
+                        }
+                        is TranslatorOrchestrator.Event.WhisperLoaded -> {
+                            setStatus("Whisper loaded (legacy)")
+                        }
+                        is TranslatorOrchestrator.Event.PartialTranscription -> {
+                            setStatus("Partial: ${event.text}")
+                        }
+                        is TranslatorOrchestrator.Event.TranscriptionResult -> {
+                            setStatus("Transcribed: ${event.text}")
+                            addMessage("[You] ${event.text}", true)
+                        }
+                        is TranslatorOrchestrator.Event.TranslationResult -> {
+                            setStatus("Translated: ${event.translated}")
+                            addMessage("[Translation] ${event.translated}", false)
+                        }
+                        is TranslatorOrchestrator.Event.QueueUpdate -> {
+                            if (event.pending > 0) setStatus("Queued: ${event.pending}")
+                        }
+                    }
+                }
+            }
+        }
+        lifecycleScope.launch {
+            translator.bleConnectionState.collect { state ->
+                withContext(Dispatchers.Main) {
+                    btnBle.text = when (state) {
+                        is BleTranslatorService.ConnectionState.Disconnected -> "BLE"
+                        is BleTranslatorService.ConnectionState.Scanning -> "Scanning"
+                        is BleTranslatorService.ConnectionState.Connecting -> "Connecting"
+                        is BleTranslatorService.ConnectionState.Connected -> state.deviceName ?: "Connected"
+                        is BleTranslatorService.ConnectionState.Ready -> "BLE Ready"
+                        is BleTranslatorService.ConnectionState.Error -> "BLE Error"
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateUiForState(state: TranslatorOrchestrator.State) {
+        btnVoice.text = when (state) {
+            is TranslatorOrchestrator.State.Listening -> "Stop Voice"
+            else -> "Start Voice"
+        }
+        isVoiceActive = state is TranslatorOrchestrator.State.Listening
+    }
+
+    private fun handleBleAction() {
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = bluetoothManager.adapter
+        if (adapter?.isEnabled != true) {
+            Toast.makeText(this, "Please enable Bluetooth", Toast.LENGTH_SHORT).show()
+            return
+        }
+        when (translator.bleConnectionState.value) {
+            is BleTranslatorService.ConnectionState.Disconnected,
+            is BleTranslatorService.ConnectionState.Error -> {
+                showBleDeviceDialog(bluetoothManager)
+            }
+            is BleTranslatorService.ConnectionState.Scanning,
+            is BleTranslatorService.ConnectionState.Connecting -> {
+                translator.stopScanning()
+            }
+            is BleTranslatorService.ConnectionState.Connected,
+            is BleTranslatorService.ConnectionState.Ready -> {
+                translator.ble.disconnect()
+            }
+        }
+    }
+
+    private fun showBleDeviceDialog(bluetoothManager: BluetoothManager) {
+        val adapter = bluetoothManager.adapter
+        val paired = adapter?.bondedDevices?.toList() ?: emptyList()
+        val names = paired.map { "${it.name ?: "Unknown"} (${it.address})" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Select ESP32-S3")
+            .setItems(names) { _, which ->
+                val device = paired[which]
+                translator.ble.startScan(device.address)
+            }
+            .setNegativeButton("Scan") { _, _ ->
+                translator.startScanningForDevice()
+            }
+            .show()
+    }
+
+    private fun toggleVoiceChat() {
+        if (!isModelReady) {
+            Toast.makeText(this, "Please load a LLM model first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (isVoiceActive) {
+            translator.stopVoiceChat()
+        } else {
+            translator.startVoiceChat(sourceLanguage = sourceLanguage, targetLanguage = targetLanguage)
         }
     }
 
@@ -85,82 +443,44 @@ class MainActivity : AppCompatActivity() {
         uri?.let { handleSelectedModel(it) }
     }
 
-    /**
-     * Handles the file Uri from [getContent] result
-     */
     private fun handleSelectedModel(uri: Uri) {
-        // Update UI states
         userActionFab.isEnabled = false
         userInputEt.hint = "Parsing GGUF..."
+        setStatus("Parsing GGUF metadata...")
         ggufTv.text = "Parsing metadata from selected file \n$uri"
 
         lifecycleScope.launch(Dispatchers.IO) {
-            // Parse GGUF metadata
-            Log.i(TAG, "Parsing GGUF metadata...")
-            contentResolver.openInputStream(uri)?.use {
-                GgufMetadataReader.create().readStructuredMetadata(it)
+            contentResolver.openInputStream(uri)?.use { stream ->
+                GgufMetadataReader.create().readStructuredMetadata(stream)
             }?.let { metadata ->
-                // Update UI to show GGUF metadata to user
                 Log.i(TAG, "GGUF parsed: \n$metadata")
                 withContext(Dispatchers.Main) {
                     ggufTv.text = metadata.toString()
+                    setStatus("Copying model file...")
                 }
 
-                // Ensure the model file is available
                 val modelName = metadata.filename() + FILE_EXTENSION_GGUF
-                contentResolver.openInputStream(uri)?.use { input ->
-                    ensureModelFile(modelName, input)
+                contentResolver.openInputStream(uri)?.use { _ ->
+                    copyFileToLocal(uri, modelName)
                 }?.let { modelFile ->
-                    loadModel(modelName, modelFile)
-
-                    withContext(Dispatchers.Main) {
-                        isModelReady = true
-                        userInputEt.hint = "Type and send a message!"
-                        userInputEt.isEnabled = true
-                        userActionFab.setImageResource(R.drawable.outline_send_24)
-                        userActionFab.isEnabled = true
-                    }
+                    withContext(Dispatchers.Main) { setStatus("Loading LLM model...") }
+                    loadLlmModel(modelFile)
                 }
             }
         }
     }
 
-    /**
-     * Prepare the model file within app's private storage
-     */
-    private suspend fun ensureModelFile(modelName: String, input: InputStream) =
+    private suspend fun copyFileToLocal(uri: Uri, fileName: String): File =
         withContext(Dispatchers.IO) {
-            File(ensureModelsDirectory(), modelName).also { file ->
-                // Copy the file into local storage if not yet done
+            File(ensureModelsDirectory(), fileName).also { file ->
                 if (!file.exists()) {
-                    Log.i(TAG, "Start copying file to $modelName")
-                    withContext(Dispatchers.Main) {
-                        userInputEt.hint = "Copying file..."
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(file).use { output -> input.copyTo(output) }
                     }
-
-                    FileOutputStream(file).use { input.copyTo(it) }
-                    Log.i(TAG, "Finished copying file to $modelName")
-                } else {
-                    Log.i(TAG, "File already exists $modelName")
                 }
             }
         }
 
-    /**
-     * Load the model file from the app private storage
-     */
-    private suspend fun loadModel(modelName: String, modelFile: File) =
-        withContext(Dispatchers.IO) {
-            Log.i(TAG, "Loading model $modelName")
-            withContext(Dispatchers.Main) {
-                userInputEt.hint = "Loading model..."
-            }
-            engine.loadModel(modelFile.path)
-        }
-
-    /**
-     * Validate and send the user message into [InferenceEngine]
-     */
     private fun handleUserInput() {
         userInputEt.text.toString().also { userMsg ->
             if (userMsg.isEmpty()) {
@@ -170,10 +490,9 @@ class MainActivity : AppCompatActivity() {
                 userInputEt.isEnabled = false
                 userActionFab.isEnabled = false
 
-                // Update message states
-                messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
+                addMessage(userMsg, true)
                 lastAssistantMsg.clear()
-                messages.add(Message(UUID.randomUUID().toString(), lastAssistantMsg.toString(), false))
+                addMessage("", false)
 
                 generationJob = lifecycleScope.launch(Dispatchers.Default) {
                     engine.sendUserPrompt(userMsg)
@@ -199,32 +518,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Run a benchmark with the model file
-     */
-    @Deprecated("This benchmark doesn't accurately indicate GUI performance expected by app developers")
-    private suspend fun runBenchmark(modelName: String, modelFile: File) =
-        withContext(Dispatchers.Default) {
-            Log.i(TAG, "Starts benchmarking $modelName")
-            withContext(Dispatchers.Main) {
-                userInputEt.hint = "Running benchmark..."
-            }
-            engine.bench(
-                pp=BENCH_PROMPT_PROCESSING_TOKENS,
-                tg=BENCH_TOKEN_GENERATION_TOKENS,
-                pl=BENCH_SEQUENCE,
-                nr=BENCH_REPETITION
-            ).let { result ->
-                messages.add(Message(UUID.randomUUID().toString(), result, false))
-                withContext(Dispatchers.Main) {
-                    messageAdapter.notifyItemChanged(messages.size - 1)
-                }
-            }
-        }
+    private fun addMessage(text: String, isUser: Boolean) {
+        messages.add(Message(UUID.randomUUID().toString(), text, isUser))
+        messageAdapter.notifyItemInserted(messages.size - 1)
+        messagesRv.scrollToPosition(messages.size - 1)
+    }
 
-    /**
-     * Create the `models` directory if not exist.
-     */
     private fun ensureModelsDirectory() =
         File(filesDir, DIRECTORY_MODELS).also {
             if (it.exists() && !it.isDirectory) { it.delete() }
@@ -237,23 +536,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        translator.destroy()
         engine.destroy()
         super.onDestroy()
     }
 
     companion object {
         private val TAG = MainActivity::class.java.simpleName
-
         private const val DIRECTORY_MODELS = "models"
         private const val FILE_EXTENSION_GGUF = ".gguf"
-
-        private const val BENCH_PROMPT_PROCESSING_TOKENS = 512
-        private const val BENCH_TOKEN_GENERATION_TOKENS = 128
-        private const val BENCH_SEQUENCE = 1
-        private const val BENCH_REPETITION = 3
     }
 }
 
+@OptIn(ExperimentalStdlibApi::class)
 fun GgufMetadata.filename() = when {
     basic.name != null -> {
         basic.name?.let { name ->

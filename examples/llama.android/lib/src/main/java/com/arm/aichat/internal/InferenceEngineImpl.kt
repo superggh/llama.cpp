@@ -54,6 +54,13 @@ internal class InferenceEngineImpl private constructor(
         private var instance: InferenceEngine? = null
 
         /**
+         * Load a shared LLM model that can be reused by both the inference engine and FunASR.
+         * Returns an opaque native pointer, or 0 on failure.
+         */
+        @JvmStatic
+        external fun loadSharedModel(modelPath: String): Long
+
+        /**
          * Create or obtain [InferenceEngineImpl]'s single instance.
          *
          * @param Context for obtaining native library directory
@@ -102,6 +109,9 @@ internal class InferenceEngineImpl private constructor(
 
     @FastNative
     private external fun generateNextToken(): String?
+
+    @FastNative
+    private external fun resetContextNative()
 
     @FastNative
     private external fun unload()
@@ -258,6 +268,16 @@ internal class InferenceEngineImpl private constructor(
             throw e
         }
     }.flowOn(llamaDispatcher)
+
+    override fun resetContext() {
+        runBlocking(llamaDispatcher) {
+            check(_state.value is InferenceEngine.State.ModelReady) {
+                "Cannot reset context in ${_state.value.javaClass.simpleName}!"
+            }
+            resetContextNative()
+            _readyForSystemPrompt = false
+        }
+    }
 
     /**
      * Benchmark the model

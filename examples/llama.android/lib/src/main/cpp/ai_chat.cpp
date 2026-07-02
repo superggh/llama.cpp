@@ -1,3 +1,5 @@
+#include "shared_model.h"
+
 #include <android/log.h>
 #include <jni.h>
 #include <iomanip>
@@ -34,6 +36,7 @@ constexpr int   BATCH_SIZE              = 512;
 constexpr float DEFAULT_SAMPLER_TEMP    = 0.3f;
 
 static llama_model                      * g_model;
+static bool                               g_model_is_shared = false;
 static llama_context                    * g_context;
 static llama_batch                        g_batch;
 static common_chat_templates_ptr          g_chat_templates;
@@ -57,6 +60,16 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject /*unu
 }
 
 extern "C"
+JNIEXPORT jlong JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_loadSharedModel(JNIEnv *env, jobject /*unused*/, jstring jmodel_path) {
+    const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
+    LOGi("Loading shared model from: %s", model_path);
+    llama_model *model = load_shared_model(model_path);
+    env->ReleaseStringUTFChars(jmodel_path, model_path);
+    return (jlong) model;
+}
+
+extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path) {
     llama_model_params model_params = llama_model_default_params();
@@ -64,7 +77,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
     LOGd("%s: Loading model from: \n%s\n", __func__, model_path);
 
-    auto *model = llama_model_load_from_file(model_path, model_params);
+    llama_model *model = get_shared_model();
+    if (model) {
+        LOGi("%s: Using shared model", __func__);
+        g_model_is_shared = true;
+    } else {
+        model = llama_model_load_from_file(model_path, model_params);
+        g_model_is_shared = false;
+    }
     env->ReleaseStringUTFChars(jmodel_path, model_path);
     if (!model) {
         return 1;
@@ -545,6 +565,13 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
 
 extern "C"
 JNIEXPORT void JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_resetContextNative(JNIEnv * /*unused*/, jobject /*unused*/) {
+    reset_long_term_states(true);
+    reset_short_term_states();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/) {
     // Reset long-term & short-term states
     reset_long_term_states();
@@ -555,11 +582,23 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, job
     g_chat_templates.reset();
     llama_batch_free(g_batch);
     llama_free(g_context);
-    llama_model_free(g_model);
+    if (g_model_is_shared) {
+        release_shared_model();
+    } else {
+        llama_model_free(g_model);
+    }
+    g_model = nullptr;
+    g_model_is_shared = false;
 }
 
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_shutdown(JNIEnv *, jobject /*unused*/) {
+    // Ensure shared model is released on shutdown
+    if (g_model_is_shared) {
+        release_shared_model();
+        g_model = nullptr;
+        g_model_is_shared = false;
+    }
     llama_backend_free();
 }

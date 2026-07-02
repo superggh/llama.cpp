@@ -5,9 +5,9 @@ plugins {
 
 android {
     namespace = "com.arm.aichat"
-    compileSdk = 36
+    compileSdk = 34
 
-    ndkVersion = "29.0.13113456"
+    ndkVersion = "26.0.10792818"
 
     defaultConfig {
         minSdk = 33
@@ -32,17 +32,18 @@ android {
                 arguments += "-DGGML_NATIVE=OFF"
                 arguments += "-DGGML_BACKEND_DL=ON"
                 arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
+                arguments += "-DGGML_CPU_KLEIDIAI=OFF"
                 arguments += "-DGGML_LLAMAFILE=OFF"
             }
         }
         aarMetadata {
-            minCompileSdk = 35
+            minCompileSdk = 34
         }
     }
     externalNativeBuild {
         cmake {
             path("src/main/cpp/CMakeLists.txt")
-            version = "3.31.6"
+            version = "3.22.1"
         }
     }
     compileOptions {
@@ -57,10 +58,8 @@ android {
         }
     }
 
-    packaging {
-        resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
-        }
+    packagingOptions {
+        exclude("/META-INF/{AL2.0,LGPL2.1}")
     }
 
     publishing {
@@ -73,6 +72,7 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.datastore.preferences)
+    implementation(libs.kotlinx.coroutines.core)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
