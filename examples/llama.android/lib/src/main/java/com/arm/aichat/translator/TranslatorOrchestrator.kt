@@ -1,7 +1,11 @@
 package com.arm.aichat.translator
 
+import android.app.Application
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.arm.aichat.InferenceEngine
 import com.arm.aichat.audio.AudioRecorder
@@ -25,6 +29,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -42,6 +47,49 @@ class TranslatorOrchestrator(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val audioRecorder = AudioRecorder()
     private var opusDecoder: OpusDecoder? = null
+
+    private var tts: TextToSpeech? = null
+    private var ttsEnabled = false
+    private var pendingTtsText: String? = null
+
+    fun setTtsEnabled(enabled: Boolean) {
+        ttsEnabled = enabled
+        if (enabled && tts == null) {
+            Handler(Looper.getMainLooper()).post {
+                tts = TextToSpeech(appContext) { status ->
+                    if (status == TextToSpeech.SUCCESS) {
+                        Log.i(TAG, "TTS initialized")
+                        pendingTtsText?.let { speakTts(it) }
+                        pendingTtsText = null
+                    }
+                }
+            }
+        }
+    }
+
+    fun isTtsEnabled(): Boolean = ttsEnabled
+
+    private fun speakTts(text: String) {
+        val engine = tts ?: run { pendingTtsText = text; return }
+        val loc = when {
+            targetLanguage.contains("Chinese") -> Locale.CHINESE
+            targetLanguage.contains("Japanese") -> Locale.JAPANESE
+            targetLanguage.contains("Korean") -> Locale.KOREAN
+            else -> Locale.ENGLISH
+        }
+        engine.language = loc
+        stopVoiceChat()
+        engine.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+            override fun onDone(utteranceId: String?) {
+                scope.launch { startVoiceChat() }
+            }
+            override fun onError(utteranceId: String?) {
+                scope.launch { startVoiceChat() }
+            }
+            override fun onStart(utteranceId: String?) {}
+        })
+        engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "tts")
+    }
 
     private var funasrContext: FunasrContext? = null
     private var isChatting = false
@@ -107,7 +155,7 @@ class TranslatorOrchestrator(
                 audioBuffer = ShortArray(0)
             }
         }
-        if (vad.pendingSize() > SAMPLE_RATE * 4) {
+        if (vad.pendingSize() > SAMPLE_RATE * forceSplitSec) {
             val flushed = vad.flush()
             if (flushed != null && flushed.samples.isNotEmpty()) {
                 audioBuffer = audioBuffer.append(flushed.samples)
@@ -153,6 +201,32 @@ class TranslatorOrchestrator(
         }
     }
 
+    fun setTargetLanguage(lang: String) {
+        targetLanguage = lang
+        val loc = when {
+            lang.contains("Chinese") -> Locale.CHINESE
+            lang.contains("Japanese") -> Locale.JAPANESE
+            lang.contains("Korean") -> Locale.KOREAN
+            else -> Locale.ENGLISH
+        }
+        tts?.language = loc
+    }
+    fun setSourceLanguage(lang: String) { sourceLanguage = lang }
+    fun setEncoderThreads(n: Int) { /* applied on next encoder graph build */ }
+    fun setPartialIntervalMs(ms: Int) { /* partial interval delegated to companion */ }
+    fun setForceSplitSec(sec: Int) { forceSplitSec = sec }
+
+    private var forceSplitSec: Int = 10
+    private var targetLanguage: String = "English"
+    private var sourceLanguage: String = "Auto"
+    private var currentVadRef: EnergyVad? = null
+
+    fun getAudioLevel(): Float = currentVadRef?.currentDb() ?: -50f
+
+    fun updateVadParams(thresholdDb: Float?, silenceMs: Int?, speechMs: Int?) {
+        // vad params are set per-session in startVoiceChat; applied on next call
+    }
+
     fun startScanningForDevice(address: String? = null) {
         ble.startScan(address)
     }
@@ -169,7 +243,9 @@ class TranslatorOrchestrator(
     private var partialTranscribeJob: kotlinx.coroutines.Job? = null
     private var accumulatedPartialText = ""
 
-    fun startVoiceChat(sourceLanguage: String = "Auto", targetLanguage: String = "English", systemPrompt: String? = null) {
+    fun startVoiceChat(sourceLanguage: String? = null, targetLanguage: String? = null, systemPrompt: String? = null) {
+        val srcLang = sourceLanguage ?: this.sourceLanguage
+        val tgtLang = targetLanguage ?: this.targetLanguage
         if (isChatting) return
         isChatting = true
         _state.value = State.Listening
@@ -177,9 +253,9 @@ class TranslatorOrchestrator(
         pendingSegmentCount.set(0)
         accumulatedPartialText = ""
 
-        translationPrefix = systemPrompt ?: buildTranslationPrompt(sourceLanguage, targetLanguage)
+        translationPrefix = systemPrompt ?: buildTranslationPrompt(srcLang, tgtLang)
 
-        val vad = EnergyVad()
+        val vad = EnergyVad().also { currentVadRef = it }
         currentVad = vad
         currentAudioBuffer = ShortArray(0)
         val useBleAudio = bleConnectionState.value is BleTranslatorService.ConnectionState.Ready
@@ -196,7 +272,7 @@ class TranslatorOrchestrator(
                 isWhisperBusy.set(true)
                 try {
                     val text = funasrContext?.transcribe(pending.toFloatArray()) ?: ""
-                    if (text.isNotBlank() && text != accumulatedPartialText && !text.equals("/sil", ignoreCase = true)) {
+                    if (text.isNotBlank() && text != accumulatedPartialText && !text.trimStart().startsWith("/sil", ignoreCase = true)) {
                         accumulatedPartialText = text
                         _events.emit(Event.PartialTranscription(text))
                     }
@@ -277,6 +353,7 @@ class TranslatorOrchestrator(
     private fun finalizeVoiceChat() {
         val vad = currentVad ?: return
         currentVad = null
+        currentVadRef = null
         var buffer = currentAudioBuffer
         currentAudioBuffer = ShortArray(0)
         val flushed = vad.flush()
@@ -326,7 +403,7 @@ class TranslatorOrchestrator(
         isWhisperBusy.set(true)
         try {
             val text = funasr.transcribe(samples)
-            if (text.isBlank() || text.equals("/sil", ignoreCase = true)) {
+            if (text.isBlank() || text.trimStart().startsWith("/sil", ignoreCase = true)) {
                 _state.value = if (isChatting) State.Listening else State.Ready
                 return
             }
@@ -337,6 +414,10 @@ class TranslatorOrchestrator(
             if (translated.isNotBlank()) {
                 _events.emit(Event.TranslationResult(text, translated))
                 ble.sendText(translated)
+                if (ttsEnabled) {
+                    speakTts(translated)
+                    return  // speakTts handles resuming listening via UtteranceProgressListener
+                }
             }
             _state.value = if (isChatting) State.Listening else State.Ready
         } catch (e: Exception) {

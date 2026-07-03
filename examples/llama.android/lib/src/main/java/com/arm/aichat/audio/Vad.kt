@@ -7,7 +7,7 @@ import java.util.concurrent.locks.ReentrantLock
 class EnergyVad(
     private val sampleRate: Int = 16000,
     private val frameMs: Int = 30,
-    private val silenceThresholdDb: Float = -20f,
+    private val silenceThresholdDb: Float = 28f,
     private val minSpeechDurationMs: Int = 400,
     private val minSilenceDurationMs: Int = 400
 ) {
@@ -21,6 +21,9 @@ class EnergyVad(
     private var silenceFrames = 0
     private var isSpeaking = false
     private var pendingSpeech = mutableListOf<Short>()
+    @Volatile private var lastFrameDb: Float = -50f
+
+    fun currentDb(): Float = lastFrameDb
 
     data class Segment(val samples: ShortArray, val isSpeech: Boolean) {
         override fun equals(other: Any?): Boolean {
@@ -59,6 +62,7 @@ class EnergyVad(
 
     private fun processFrame(frame: ShortArray): Segment? {
         val energyDb = 10f * kotlin.math.log10(rms(frame).toDouble().coerceAtLeast(1e-10)).toFloat()
+        lastFrameDb = energyDb
         val isSpeechFrame = energyDb > silenceThresholdDb
 
         return when {
