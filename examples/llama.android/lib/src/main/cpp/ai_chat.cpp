@@ -279,6 +279,7 @@ constexpr const char *ROLE_ASSISTANT    = "assistant";
 static std::vector<common_chat_msg> chat_msgs;
 static llama_pos system_prompt_position;
 static llama_pos current_position;
+static bool system_prompt_cached = false;
 
 static void reset_long_term_states(const bool clear_kv_cache = true) {
     chat_msgs.clear();
@@ -287,6 +288,7 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
 
     if (clear_kv_cache)
         llama_memory_clear(llama_get_memory(g_context), false);
+    system_prompt_cached = false;
 }
 
 /**
@@ -377,6 +379,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         jobject /*unused*/,
         jstring jsystem_prompt
 ) {
+    // If system prompt is already cached, skip re-decoding
+    if (system_prompt_cached) {
+        LOGi("System prompt already cached, reusing KV cache");
+        return 0;
+    }
+
     // Reset long-term & short-term states
     reset_long_term_states();
     reset_short_term_states();
@@ -416,6 +424,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
 
     // Update position
     system_prompt_position = current_position = (int) system_tokens.size();
+    system_prompt_cached = true;
+    LOGi("System prompt cached at position %d", system_prompt_position);
     return 0;
 }
 
@@ -566,8 +576,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_resetContextNative(JNIEnv * /*unused*/, jobject /*unused*/) {
+    system_prompt_cached = false;
     reset_long_term_states(true);
     reset_short_term_states();
+    LOGi("Context reset, system prompt cache cleared");
 }
 
 extern "C"

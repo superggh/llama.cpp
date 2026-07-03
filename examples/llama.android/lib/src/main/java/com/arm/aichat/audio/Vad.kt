@@ -7,9 +7,9 @@ import java.util.concurrent.locks.ReentrantLock
 class EnergyVad(
     private val sampleRate: Int = 16000,
     private val frameMs: Int = 30,
-    private val silenceThresholdDb: Float = -40f,
-    private val minSpeechDurationMs: Int = 300,
-    private val minSilenceDurationMs: Int = 700
+    private val silenceThresholdDb: Float = -20f,
+    private val minSpeechDurationMs: Int = 400,
+    private val minSilenceDurationMs: Int = 400
 ) {
     private val frameSize = sampleRate * frameMs / 1000
     private val minSpeechFrames = minSpeechDurationMs / frameMs

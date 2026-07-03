@@ -107,7 +107,7 @@ class TranslatorOrchestrator(
                 audioBuffer = ShortArray(0)
             }
         }
-        if (vad.pendingSize() > SAMPLE_RATE * 10) {
+        if (vad.pendingSize() > SAMPLE_RATE * 4) {
             val flushed = vad.flush()
             if (flushed != null && flushed.samples.isNotEmpty()) {
                 audioBuffer = audioBuffer.append(flushed.samples)
@@ -196,7 +196,7 @@ class TranslatorOrchestrator(
                 isWhisperBusy.set(true)
                 try {
                     val text = funasrContext?.transcribe(pending.toFloatArray()) ?: ""
-                    if (text.isNotBlank() && text != accumulatedPartialText) {
+                    if (text.isNotBlank() && text != accumulatedPartialText && !text.equals("/sil", ignoreCase = true)) {
                         accumulatedPartialText = text
                         _events.emit(Event.PartialTranscription(text))
                     }
@@ -231,12 +231,11 @@ class TranslatorOrchestrator(
     }
 
     private fun buildTranslationPrompt(sourceLanguage: String, targetLanguage: String): String {
-        val sourcePart = if (sourceLanguage.equals("Auto", ignoreCase = true)) {
-            "the detected source language"
+        return if (targetLanguage.equals("Chinese", ignoreCase = true)) {
+            "将以下文本翻译为中文。注意只输出翻译结果，不要额外解释："
         } else {
-            sourceLanguage
+            "Translate the following text into $targetLanguage. Note that you should only output the translated result without any additional explanation:"
         }
-        return "You are a translator. Translate the user's input from $sourcePart to $targetLanguage. Output only the translation, no explanation.\n\n"
     }
 
     private fun setStatus(message: String) {
@@ -313,8 +312,9 @@ class TranslatorOrchestrator(
     private suspend fun translateWithLlm(text: String): String =
         withContext(Dispatchers.IO) {
             engine.resetContext()
+            engine.setSystemPrompt(translationPrefix)
             val sb = StringBuilder()
-            engine.sendUserPrompt(translationPrefix + text).collect { token ->
+            engine.sendUserPrompt(text).collect { token ->
                 sb.append(token)
             }
             sb.toString().trim()
@@ -326,7 +326,7 @@ class TranslatorOrchestrator(
         isWhisperBusy.set(true)
         try {
             val text = funasr.transcribe(samples)
-            if (text.isBlank()) {
+            if (text.isBlank() || text.equals("/sil", ignoreCase = true)) {
                 _state.value = if (isChatting) State.Listening else State.Ready
                 return
             }

@@ -275,7 +275,7 @@ internal class InferenceEngineImpl private constructor(
                 "Cannot reset context in ${_state.value.javaClass.simpleName}!"
             }
             resetContextNative()
-            _readyForSystemPrompt = false
+            _readyForSystemPrompt = true
         }
     }
 

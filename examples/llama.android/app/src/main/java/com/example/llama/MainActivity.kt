@@ -348,11 +348,11 @@ class MainActivity : AppCompatActivity() {
                         }
                         is TranslatorOrchestrator.Event.TranscriptionResult -> {
                             setStatus("Transcribed: ${event.text}")
-                            addMessage("[You] ${event.text}", true)
+                            addMessage(event.text, true)
                         }
                         is TranslatorOrchestrator.Event.TranslationResult -> {
                             setStatus("Translated: ${event.translated}")
-                            addMessage("[Translation] ${event.translated}", false)
+                            addMessage(event.translated, false)
                         }
                         is TranslatorOrchestrator.Event.QueueUpdate -> {
                             if (event.pending > 0) setStatus("Queued: ${event.pending}")

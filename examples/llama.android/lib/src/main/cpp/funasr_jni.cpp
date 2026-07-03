@@ -233,38 +233,49 @@ static std::shared_ptr<EncGraphCache> build_encoder_graph(enc_model &m, int T, i
     return cache;
 }
 
+static int get_enc_bucket(int T) {
+    if (T <= 64) return 64;
+    if (T <= 96) return 96;
+    if (T <= 128) return 128;
+    if (T <= 160) return 160;
+    if (T <= 192) return 192;
+    if (T <= 256) return 256;
+    return T;
+}
+
 static std::vector<float> run_encoder_cached(FunasrCtx *fc, std::vector<float>& fbank, int T, int F, int &Dout) {
     Dout = 0;
     if (!fc || !fc->enc_backend) return {};
 
+    int T_bucket = get_enc_bucket(T);
+    bool padded = T_bucket > T;
+    if (padded) fbank.resize((size_t)T_bucket * F, 0.0f);
+
     float sc = sqrtf((float)fc->em.c.d_model);
-    for (auto &v : fbank) v *= sc;
-    add_posenc(fbank, T, F);
+    for (size_t i = 0; i < (size_t)T * F; i++) fbank[i] *= sc;
+    for (size_t i = (size_t)T * F; i < fbank.size(); i++) fbank[i] = 0.0f;
+    add_posenc(fbank, T_bucket, F);
 
     std::shared_ptr<EncGraphCache> cache;
-    auto it = fc->enc_cache.find(T);
+    auto it = fc->enc_cache.find(T_bucket);
     if (it != fc->enc_cache.end()) {
         cache = it->second;
     } else {
-        LOGI("Building encoder graph for T=%d", T);
-        cache = build_encoder_graph(fc->em, T, F, fc->enc_backend);
+        LOGI("Building encoder graph for T=%d (bucket=%d)", T, T_bucket);
+        cache = build_encoder_graph(fc->em, T_bucket, F, fc->enc_backend);
         if (!cache) return {};
-        // limit cache size
-        if ((int)fc->enc_cache.size() >= FunasrCtx::MAX_ENC_CACHE) {
+        if ((int)fc->enc_cache.size() >= FunasrCtx::MAX_ENC_CACHE)
             fc->enc_cache.erase(fc->enc_cache.begin());
-        }
-        fc->enc_cache[T] = cache;
+        fc->enc_cache[T_bucket] = cache;
     }
 
     ggml_backend_tensor_set(cache->inp, fbank.data(), 0, ggml_nbytes(cache->inp));
     if (ggml_backend_graph_compute(fc->enc_backend, cache->gf) != GGML_STATUS_SUCCESS) {
-        LOGE("encoder graph compute failed");
-        return {};
+        LOGE("encoder graph compute failed"); return {};
     }
-
     Dout = cache->D;
     std::vector<float> out((size_t)Dout * T);
-    ggml_backend_tensor_get(cache->out, out.data(), 0, ggml_nbytes(cache->out));
+    ggml_backend_tensor_get(cache->out, out.data(), 0, (size_t)Dout * T * sizeof(float));
     return out;
 }
 
@@ -300,8 +311,8 @@ Java_com_arm_aichat_funasr_FunasrLib_00024Companion_init(
             fc->set_n_threads_fn = (FunasrCtx::set_n_threads_fn_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_set_n_threads");
         }
         if (fc->set_n_threads_fn) {
-            fc->set_n_threads_fn(fc->enc_backend, 8);
-            LOGI("Set encoder backend threads=8");
+            fc->set_n_threads_fn(fc->enc_backend, 4);
+            LOGI("Set encoder backend threads=4");
         } else {
             LOGW("Could not set encoder backend threads");
         }
@@ -335,8 +346,8 @@ Java_com_arm_aichat_funasr_FunasrLib_00024Companion_init(
     const llama_vocab *vocab = llama_model_get_vocab(fc->model);
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 1024;
-    cp.n_batch = 512;
-    cp.n_ubatch = 512;
+    cp.n_batch = 256;
+    cp.n_ubatch = 256;
     cp.n_threads = 4;
     cp.n_threads_batch = 4;
     fc->ctx = llama_init_from_model(fc->model, cp);
